@@ -10,10 +10,17 @@
  * License URI:       http://www.gnu.org/licenses/gpl-2.0.txt
  */
 
-// Prevent direct file access
+/// Prevent direct file access
 if ( ! defined( 'ABSPATH' ) ) {
     exit; // Exit if accessed directly
 }
+
+// Increase PHP limits for large operations
+// Set maximum execution time to unlimited (0)
+set_time_limit(0);
+// Set memory limit to 512MB to handle large data exports/deletions
+ini_set('memory_limit', '512M');
+
 
 /**
  * Register admin menu pages.
@@ -50,6 +57,22 @@ function wpmd_register_admin_menu_pages() {
 add_action( 'admin_menu', 'wpmd_register_admin_menu_pages' );
 
 /**
+ * Enqueue admin scripts for dynamic counts and general functionality.
+ */
+function wpmd_enqueue_admin_scripts( $hook_suffix ) {
+    // Only load on plugin's admin pages
+    if ( strpos( $hook_suffix, 'wpmd-manager' ) !== false || strpos( $hook_suffix, 'wpmd-manage-posts' ) !== false || strpos( $hook_suffix, 'wpmd-manage-users' ) !== false ) {
+        wp_enqueue_script( 'wpmd-admin-script', plugin_dir_url( __FILE__ ) . 'wpmd-admin.js', array( 'jquery' ), '1.0', true );
+        wp_localize_script( 'wpmd-admin-script', 'wpmd_ajax_object', array(
+            'ajax_url' => admin_url( 'admin-ajax.php' ),
+            'nonce'    => wp_create_nonce( 'wpmd_ajax_nonce' ),
+        ) );
+    }
+}
+add_action( 'admin_enqueue_scripts', 'wpmd_enqueue_admin_scripts' );
+
+
+/**
  * Main dashboard page content.
  */
 function wpmd_main_dashboard_page_content() {
@@ -69,9 +92,30 @@ function wpmd_posts_management_page_content() {
     // Handle form submissions for posts
     wpmd_handle_posts_action();
 
-    // Get all public post types
-    $post_types = get_post_types( array( 'public' => true ), 'objects' );
-    unset( $post_types['attachment'] ); // Exclude attachments
+    // Get all post types that are shown in the UI (admin area)
+    $post_types = get_post_types( array( 'show_ui' => true ), 'objects' );
+
+    // Exclude specific built-in post types that are typically not managed directly by users for export/deletion
+    $excluded_post_types = array(
+        'attachment',
+        'revision',
+        'nav_menu_item',
+        'custom_css',
+        'customize_changeset',
+        'oembed_cache',
+        'user_request', // GDPR requests
+        'wp_block', // Reusable blocks
+        'wp_template', // FSE templates
+        'wp_template_part', // FSE template parts
+        'wp_global_styles', // FSE global styles
+        'wp_navigation', // FSE navigation
+    );
+
+    foreach ( $excluded_post_types as $exclude_key ) {
+        if ( isset( $post_types[ $exclude_key ] ) ) {
+            unset( $post_types[ $exclude_key ] );
+        }
+    }
 
     ?>
     <div class="wrap">
@@ -80,6 +124,12 @@ function wpmd_posts_management_page_content() {
         <?php if ( isset( $_GET['message'] ) ) : ?>
             <div class="notice notice-success is-dismissible">
                 <p><?php echo esc_html( sanitize_text_field( $_GET['message'] ) ); ?></p>
+            </div>
+        <?php endif; ?>
+
+        <?php if ( isset( $_GET['error_message'] ) ) : ?>
+            <div class="notice notice-error is-dismissible">
+                <p><?php echo esc_html( sanitize_text_field( $_GET['error_message'] ) ); ?></p>
             </div>
         <?php endif; ?>
 
@@ -126,122 +176,12 @@ function wpmd_posts_management_page_content() {
                     </tr>
                 </tbody>
             </table>
+            <p id="wpmd-export-post-count-info" class="description"></p>
             <p class="submit">
                 <input type="submit" name="wpmd_export_posts_submit" id="wpmd_export_posts_submit" class="button button-primary" value="<?php esc_attr_e( 'Export Posts to CSV', 'wpmd' ); ?>">
             </p>
         </form>
-        <script>
-            // JavaScript to toggle date input fields based on radio button selection
-            document.addEventListener('DOMContentLoaded', function() {
-                const exportDateOptionAll = document.getElementById('wpmd_export_date_option_all');
-                const exportDateOptionSingle = document.getElementById('wpmd_export_date_option_single');
-                const exportDateOptionRange = document.getElementById('wpmd_export_date_option_range');
-                const exportDateSingle = document.getElementById('wpmd_export_date_single');
-                const exportDateCondition = document.getElementById('wpmd_export_date_condition');
-                const exportDateStart = document.getElementById('wpmd_export_date_start');
-                const exportDateEnd = document.getElementById('wpmd_export_date_end');
 
-                const deleteDateOptionAll = document.getElementById('wpmd_delete_date_option_all');
-                const deleteDateOptionSingle = document.getElementById('wpmd_delete_date_option_single');
-                const deleteDateOptionRange = document.getElementById('wpmd_delete_date_option_range');
-                const deleteDateSingle = document.getElementById('wpmd_delete_date_single');
-                const deleteDateCondition = document.getElementById('wpmd_delete_date_condition');
-                const deleteDateStart = document.getElementById('wpmd_delete_date_start');
-                const deleteDateEnd = document.getElementById('wpmd_delete_date_end');
-
-                function toggleExportDateFields() {
-                    if (exportDateOptionSingle.checked) {
-                        exportDateSingle.disabled = false;
-                        exportDateCondition.disabled = false;
-                        exportDateStart.disabled = true;
-                        exportDateEnd.disabled = true;
-                    } else if (exportDateOptionRange.checked) {
-                        exportDateSingle.disabled = true;
-                        exportDateCondition.disabled = true;
-                        exportDateStart.disabled = false;
-                        exportDateEnd.disabled = false;
-                    } else { // 'all' is checked
-                        exportDateSingle.disabled = true;
-                        exportDateCondition.disabled = true;
-                        exportDateStart.disabled = true;
-                        exportDateEnd.disabled = true;
-                    }
-                }
-
-                function toggleDeleteDateFields() {
-                    if (deleteDateOptionAll && deleteDateOptionSingle && deleteDateOptionRange) { // Check if elements exist
-                        if (deleteDateOptionSingle.checked) {
-                            deleteDateSingle.disabled = false;
-                            deleteDateCondition.disabled = false;
-                            deleteDateStart.disabled = true;
-                            deleteDateEnd.disabled = true;
-                            document.getElementById('wpmd_delete_all_posts').disabled = true; // Disable "Delete All" checkbox
-                            document.getElementById('wpmd_delete_all_posts').checked = false;
-                        } else if (deleteDateOptionRange.checked) {
-                            deleteDateSingle.disabled = true;
-                            deleteDateCondition.disabled = true;
-                            deleteDateStart.disabled = false;
-                            deleteDateEnd.disabled = false;
-                            document.getElementById('wpmd_delete_all_posts').disabled = true; // Disable "Delete All" checkbox
-                            document.getElementById('wpmd_delete_all_posts').checked = false;
-                        } else { // 'all' is checked or no date option is selected (delete all is active)
-                            deleteDateSingle.disabled = true;
-                            deleteDateCondition.disabled = true;
-                            deleteDateStart.disabled = true;
-                            deleteDateEnd.disabled = true;
-                            document.getElementById('wpmd_delete_all_posts').disabled = false; // Enable "Delete All" checkbox
-                        }
-                    }
-                }
-
-                // Initial state
-                toggleExportDateFields();
-                toggleDeleteDateFields();
-
-                // Add event listeners
-                exportDateOptionAll.addEventListener('change', toggleExportDateFields);
-                exportDateOptionSingle.addEventListener('change', toggleExportDateFields);
-                exportDateOptionRange.addEventListener('change', toggleExportDateFields);
-
-                // Check if delete date options exist before adding listeners
-                if (deleteDateOptionAll) {
-                    deleteDateOptionAll.addEventListener('change', toggleDeleteDateFields);
-                }
-                if (deleteDateOptionSingle) {
-                    deleteDateOptionSingle.addEventListener('change', toggleDeleteDateFields);
-                }
-                if (deleteDateOptionRange) {
-                    deleteDateOptionRange.addEventListener('change', toggleDeleteDateFields);
-                }
-
-                // If "Delete All" checkbox is checked, disable date options
-                const deleteAllPostsCheckbox = document.getElementById('wpmd_delete_all_posts');
-                if (deleteAllPostsCheckbox) {
-                    deleteAllPostsCheckbox.addEventListener('change', function() {
-                        if (this.checked) {
-                            if (deleteDateOptionAll) deleteDateOptionAll.disabled = true;
-                            if (deleteDateOptionSingle) deleteDateOptionSingle.disabled = true;
-                            if (deleteDateOptionRange) deleteDateOptionRange.disabled = true;
-                            deleteDateSingle.disabled = true;
-                            deleteDateCondition.disabled = true;
-                            deleteDateStart.disabled = true;
-                            deleteDateEnd.disabled = true;
-                        } else {
-                            if (deleteDateOptionAll) deleteDateOptionAll.disabled = false;
-                            if (deleteDateOptionSingle) deleteDateOptionSingle.disabled = false;
-                            if (deleteDateOptionRange) deleteDateOptionRange.disabled = false;
-                            toggleDeleteDateFields(); // Re-evaluate based on date options
-                        }
-                    });
-                     // Initial state for delete all checkbox
-                    if (deleteAllPostsCheckbox.checked) {
-                        if (deleteDateOptionAll) deleteDateOptionAll.disabled = true;
-                        if (deleteDateOptionSingle) deleteDateOptionSingle.disabled = true;
-                        if (deleteDateOptionRange) deleteDateOptionRange.disabled = true;
-                    }
-                }
-            });
-        </script>
 
         <hr>
 
@@ -298,6 +238,7 @@ function wpmd_posts_management_page_content() {
                     </tr>
                 </tbody>
             </table>
+            <p id="wpmd-delete-post-count-info" class="description"></p>
             <p class="submit">
                 <input type="submit" name="wpmd_delete_posts_submit" id="wpmd_delete_posts_submit" class="button button-danger" value="<?php esc_attr_e( 'Delete Posts', 'wpmd' ); ?>" onclick="return confirm('<?php esc_attr_e( 'Are you sure you want to delete these posts? This action cannot be undone.', 'wpmd' ); ?>');">
             </p>
@@ -324,6 +265,12 @@ function wpmd_users_management_page_content() {
         <?php if ( isset( $_GET['message'] ) ) : ?>
             <div class="notice notice-success is-dismissible">
                 <p><?php echo esc_html( sanitize_text_field( $_GET['message'] ) ); ?></p>
+            </div>
+        <?php endif; ?>
+
+        <?php if ( isset( $_GET['error_message'] ) ) : ?>
+            <div class="notice notice-error is-dismissible">
+                <p><?php echo esc_html( sanitize_text_field( $_GET['error_message'] ) ); ?></p>
             </div>
         <?php endif; ?>
 
@@ -370,124 +317,11 @@ function wpmd_users_management_page_content() {
                     </tr>
                 </tbody>
             </table>
+            <p id="wpmd-export-user-count-info" class="description"></p>
             <p class="submit">
                 <input type="submit" name="wpmd_export_users_submit" id="wpmd_export_users_submit" class="button button-primary" value="<?php esc_attr_e( 'Export Users to CSV', 'wpmd' ); ?>">
             </p>
         </form>
-        <script>
-            // JavaScript to toggle user date input fields based on radio button selection
-            document.addEventListener('DOMContentLoaded', function() {
-                const userExportDateOptionAll = document.getElementById('wpmd_user_export_date_option_all');
-                const userExportDateOptionSingle = document.getElementById('wpmd_user_export_date_option_single');
-                const userExportDateOptionRange = document.getElementById('wpmd_user_export_date_option_range');
-                const userExportDateSingle = document.getElementById('wpmd_user_export_date_single');
-                const userExportDateCondition = document.getElementById('wpmd_user_export_date_condition');
-                const userExportDateStart = document.getElementById('wpmd_user_export_date_start');
-                const userExportDateEnd = document.getElementById('wpmd_user_export_date_end');
-
-                const userDeleteDateOptionAll = document.getElementById('wpmd_user_delete_date_option_all');
-                const userDeleteDateOptionSingle = document.getElementById('wpmd_user_delete_date_option_single');
-                const userDeleteDateOptionRange = document.getElementById('wpmd_user_delete_date_option_range');
-                const userDeleteDateSingle = document.getElementById('wpmd_user_delete_date_single');
-                const userDeleteDateCondition = document.getElementById('wpmd_user_delete_date_condition');
-                const userDeleteDateStart = document.getElementById('wpmd_user_delete_date_start');
-                const userDeleteDateEnd = document.getElementById('wpmd_user_delete_date_end');
-
-
-                function toggleUserExportDateFields() {
-                    if (userExportDateOptionSingle.checked) {
-                        userExportDateSingle.disabled = false;
-                        userExportDateCondition.disabled = false;
-                        userExportDateStart.disabled = true;
-                        userExportDateEnd.disabled = true;
-                    } else if (userExportDateOptionRange.checked) {
-                        userExportDateSingle.disabled = true;
-                        userExportDateCondition.disabled = true;
-                        userExportDateStart.disabled = false;
-                        userExportDateEnd.disabled = false;
-                    } else { // 'all' is checked
-                        userExportDateSingle.disabled = true;
-                        userExportDateCondition.disabled = true;
-                        userExportDateStart.disabled = true;
-                        userExportDateEnd.disabled = true;
-                    }
-                }
-
-                function toggleUserDeleteDateFields() {
-                     if (userDeleteDateOptionAll && userDeleteDateOptionSingle && userDeleteDateOptionRange) { // Check if elements exist
-                        if (userDeleteDateOptionSingle.checked) {
-                            userDeleteDateSingle.disabled = false;
-                            userDeleteDateCondition.disabled = false;
-                            userDeleteDateStart.disabled = true;
-                            userDeleteDateEnd.disabled = true;
-                            document.getElementById('wpmd_delete_all_users').disabled = true; // Disable "Delete All" checkbox
-                            document.getElementById('wpmd_delete_all_users').checked = false;
-                        } else if (userDeleteDateOptionRange.checked) {
-                            userDeleteDateSingle.disabled = true;
-                            userDeleteDateCondition.disabled = true;
-                            userDeleteDateStart.disabled = false;
-                            userDeleteDateEnd.disabled = false;
-                            document.getElementById('wpmd_delete_all_users').disabled = true; // Disable "Delete All" checkbox
-                            document.getElementById('wpmd_delete_all_users').checked = false;
-                        } else { // 'all' is checked or no date option is selected (delete all is active)
-                            userDeleteDateSingle.disabled = true;
-                            userDeleteDateCondition.disabled = true;
-                            userDeleteDateStart.disabled = true;
-                            userDeleteDateEnd.disabled = true;
-                            document.getElementById('wpmd_delete_all_users').disabled = false; // Enable "Delete All" checkbox
-                        }
-                    }
-                }
-
-                // Initial state
-                toggleUserExportDateFields();
-                toggleUserDeleteDateFields();
-
-                // Add event listeners
-                userExportDateOptionAll.addEventListener('change', toggleUserExportDateFields);
-                userExportDateOptionSingle.addEventListener('change', toggleUserExportDateFields);
-                userExportDateOptionRange.addEventListener('change', toggleUserExportDateFields);
-
-                // Check if delete date options exist before adding listeners
-                if (userDeleteDateOptionAll) {
-                    userDeleteDateOptionAll.addEventListener('change', toggleUserDeleteDateFields);
-                }
-                if (userDeleteDateOptionSingle) {
-                    userDeleteDateOptionSingle.addEventListener('change', toggleUserDeleteDateFields);
-                }
-                if (userDeleteDateOptionRange) {
-                    userDeleteDateOptionRange.addEventListener('change', toggleUserDeleteDateFields);
-                }
-
-                // If "Delete All" checkbox is checked, disable date options
-                const deleteAllUsersCheckbox = document.getElementById('wpmd_delete_all_users');
-                if (deleteAllUsersCheckbox) {
-                    deleteAllUsersCheckbox.addEventListener('change', function() {
-                        if (this.checked) {
-                            if (userDeleteDateOptionAll) userDeleteDateOptionAll.disabled = true;
-                            if (userDeleteDateOptionSingle) userDeleteDateOptionSingle.disabled = true;
-                            if (userDeleteDateOptionRange) userDeleteDateOptionRange.disabled = true;
-                            userDeleteDateSingle.disabled = true;
-                            userDeleteDateCondition.disabled = true;
-                            userDeleteDateStart.disabled = true;
-                            userDeleteDateEnd.disabled = true;
-                        } else {
-                            if (userDeleteDateOptionAll) userDeleteDateOptionAll.disabled = false;
-                            if (userDeleteDateOptionSingle) userDeleteDateOptionSingle.disabled = false;
-                            if (userDeleteDateOptionRange) userDeleteDateOptionRange.disabled = false;
-                            toggleUserDeleteDateFields(); // Re-evaluate based on date options
-                        }
-                    });
-                    // Initial state for delete all checkbox
-                    if (deleteAllUsersCheckbox.checked) {
-                        if (userDeleteDateOptionAll) userDeleteDateOptionAll.disabled = true;
-                        if (userDeleteDateOptionSingle) userDeleteDateOptionSingle.disabled = true;
-                        if (userDeleteDateOptionRange) userDeleteDateOptionRange.disabled = true;
-                    }
-                }
-            });
-        </script>
-
 
         <hr>
 
@@ -544,6 +378,7 @@ function wpmd_users_management_page_content() {
                     </tr>
                 </tbody>
             </table>
+            <p id="wpmd-delete-user-count-info" class="description"></p>
             <p class="submit">
                 <input type="submit" name="wpmd_delete_users_submit" id="wpmd_delete_users_submit" class="button button-danger" value="<?php esc_attr_e( 'Delete Users', 'wpmd' ); ?>" onclick="return confirm('<?php esc_attr_e( 'Are you sure you want to delete these users? This action cannot be undone.', 'wpmd' ); ?>');">
             </p>
@@ -592,55 +427,8 @@ function wpmd_handle_posts_action() {
             wp_safe_redirect( add_query_arg( 'message', urlencode( $message ), admin_url( 'admin.php?page=wpmd-manage-posts' ) ) );
             exit;
         } else {
-            $message = __( 'Error deleting posts.', 'wpmd' );
-            wp_safe_redirect( add_query_arg( 'message', urlencode( $message ), admin_url( 'admin.php?page=wpmd-manage-posts' ) ) );
-            exit;
-        }
-    }
-}
-
-/**
- * Handle user actions (export and delete).
- */
-function wpmd_handle_users_action() {
-    // Handle Export Users
-    if ( isset( $_POST['wpmd_export_users_submit'] ) && current_user_can( 'manage_options' ) ) {
-        if ( ! isset( $_POST['wpmd_export_users_nonce_field'] ) || ! wp_verify_nonce( $_POST['wpmd_export_users_nonce_field'], 'wpmd_export_users_nonce' ) ) {
-            wp_die( __( 'Security check failed.', 'wpmd' ) );
-        }
-
-        $user_role = sanitize_text_field( $_POST['wpmd_user_role_export'] );
-        $date_option = sanitize_text_field( $_POST['wpmd_user_export_date_option'] );
-        $date_single = sanitize_text_field( $_POST['wpmd_user_export_date_single'] );
-        $date_condition = sanitize_text_field( $_POST['wpmd_user_export_date_condition'] );
-        $date_start = sanitize_text_field( $_POST['wpmd_user_export_date_start'] );
-        $date_end = sanitize_text_field( $_POST['wpmd_user_export_date_end'] );
-
-        wpmd_export_users_to_csv( $user_role, $date_option, $date_single, $date_condition, $date_start, $date_end );
-    }
-
-    // Handle Delete Users
-    if ( isset( $_POST['wpmd_delete_users_submit'] ) && current_user_can( 'manage_options' ) ) {
-        if ( ! isset( $_POST['wpmd_delete_users_nonce_field'] ) || ! wp_verify_nonce( $_POST['wpmd_delete_users_nonce_field'], 'wpmd_delete_users_nonce' ) ) {
-            wp_die( __( 'Security check failed.', 'wpmd' ) );
-        }
-
-        $user_role        = sanitize_text_field( $_POST['wpmd_user_role_delete'] );
-        $delete_all_users = isset( $_POST['wpmd_delete_all_users'] ) ? true : false;
-        $date_option      = sanitize_text_field( $_POST['wpmd_user_delete_date_option'] );
-        $date_single      = sanitize_text_field( $_POST['wpmd_user_delete_date_single'] );
-        $date_condition   = sanitize_text_field( $_POST['wpmd_user_delete_date_condition'] );
-        $date_start       = sanitize_text_field( $_POST['wpmd_user_delete_date_start'] );
-        $date_end         = sanitize_text_field( $_POST['wpmd_user_delete_date_end'] );
-
-        $deleted_count = wpmd_delete_users( $user_role, $delete_all_users, $date_option, $date_single, $date_condition, $date_start, $date_end );
-        if ( $deleted_count !== false ) {
-            $message = sprintf( _n( '%s user deleted successfully.', '%s users deleted successfully.', $deleted_count, 'wpmd' ), $deleted_count );
-            wp_safe_redirect( add_query_arg( 'message', urlencode( $message ), admin_url( 'admin.php?page=wpmd-manage-users' ) ) );
-            exit;
-        } else {
-            $message = __( 'Error deleting users.', 'wpmd' );
-            wp_safe_redirect( add_query_arg( 'message', urlencode( $message ), admin_url( 'admin.php?page=wpmd-manage-users' ) ) );
+            $error_message = __( 'Error deleting posts. Check your debug log for details.', 'wpmd' );
+            wp_safe_redirect( add_query_arg( 'error_message', urlencode( $error_message ), admin_url( 'admin.php?page=wpmd-manage-posts' ) ) );
             exit;
         }
     }
@@ -697,7 +485,7 @@ function wpmd_export_posts_to_csv( $post_type, $date_option, $date_single, $date
 
     if ( empty( $posts ) ) {
         // Redirect back with a message if no posts found
-        wp_safe_redirect( add_query_arg( 'message', urlencode( __( 'No posts found for the selected type and date filters to export.', 'wpmd' ) ), admin_url( 'admin.php?page=wpmd-manage-posts' ) ) );
+        wp_safe_redirect( add_query_arg( 'message', urlencode( __( 'No posts found for the selected type and date filters to export. Try adjusting your filters.', 'wpmd' ) ), admin_url( 'admin.php?page=wpmd-manage-posts' ) ) );
         exit;
     }
 
@@ -804,6 +592,14 @@ function wpmd_export_posts_to_csv( $post_type, $date_option, $date_single, $date
  * @return int|false Number of deleted posts on success, false on error.
  */
 function wpmd_delete_posts( $post_type, $delete_all, $date_option, $date_single, $date_condition, $date_start, $date_end ) {
+    error_log( 'wpmd_delete_posts called for post type: ' . $post_type );
+    error_log( 'Delete all: ' . ( $delete_all ? 'true' : 'false' ) );
+    error_log( 'Date option: ' . $date_option );
+    error_log( 'Date single: ' . $date_single );
+    error_log( 'Date condition: ' . $date_condition );
+    error_log( 'Date start: ' . $date_start );
+    error_log( 'Date end: ' . $date_end );
+
     $args = array(
         'post_type'      => $post_type,
         'posts_per_page' => -1,
@@ -813,6 +609,7 @@ function wpmd_delete_posts( $post_type, $delete_all, $date_option, $date_single,
 
     if ( $delete_all ) {
         // No date filtering needed if deleting all
+        error_log( 'Deleting all posts of type: ' . $post_type );
     } elseif ( 'single' === $date_option && ! empty( $date_single ) ) {
         if ( 'before' === $date_condition ) {
             $args['date_query'] = array(
@@ -821,6 +618,7 @@ function wpmd_delete_posts( $post_type, $delete_all, $date_option, $date_single,
                     'inclusive' => true,
                 ),
             );
+            error_log( 'Deleting posts before: ' . $date_single );
         } elseif ( 'after' === $date_condition ) {
             $args['date_query'] = array(
                 array(
@@ -828,6 +626,7 @@ function wpmd_delete_posts( $post_type, $delete_all, $date_option, $date_single,
                     'inclusive' => true,
                 ),
             );
+            error_log( 'Deleting posts after: ' . $date_single );
         }
     } elseif ( 'range' === $date_option && ! empty( $date_start ) && ! empty( $date_end ) ) {
         $args['date_query'] = array(
@@ -837,13 +636,16 @@ function wpmd_delete_posts( $post_type, $delete_all, $date_option, $date_single,
                 'inclusive' => true,
             ),
         );
+        error_log( 'Deleting posts between: ' . $date_start . ' and ' . $date_end );
     } else {
-        // If no delete_all, and no valid date filter chosen, return 0.
+        error_log( 'No valid deletion criteria for posts. Returning 0.' );
         return 0;
     }
 
     $posts_to_delete = get_posts( $args );
     $deleted_count   = 0;
+
+    error_log( 'Found ' . count( $posts_to_delete ) . ' posts to delete.' );
 
     if ( $posts_to_delete ) {
         foreach ( $posts_to_delete as $post_id ) {
@@ -851,11 +653,15 @@ function wpmd_delete_posts( $post_type, $delete_all, $date_option, $date_single,
             $result = wp_delete_post( $post_id, true );
             if ( $result && ! is_wp_error( $result ) ) {
                 $deleted_count++;
+                error_log( 'Successfully deleted post ID: ' . $post_id );
             } else {
                 // Log error or handle it as needed
-                error_log( 'Error deleting post ID ' . $post_id . ': ' . ( is_wp_error( $result ) ? $result->get_error_message() : 'Unknown error' ) );
+                $error_message = is_wp_error( $result ) ? $result->get_error_message() : 'Unknown error';
+                error_log( 'Error deleting post ID ' . $post_id . ': ' . $error_message );
             }
         }
+    } else {
+        error_log( 'No posts found matching the criteria for deletion.' );
     }
 
     return $deleted_count;
@@ -913,7 +719,7 @@ function wpmd_export_users_to_csv( $user_role, $date_option, $date_single, $date
 
     if ( empty( $user_ids ) ) {
         // Redirect back with a message if no users found
-        wp_safe_redirect( add_query_arg( 'message', urlencode( __( 'No users found for the selected role and date filters to export.', 'wpmd' ) ), admin_url( 'admin.php?page=wpmd-manage-users' ) ) );
+        wp_safe_redirect( add_query_arg( 'message', urlencode( __( 'No users found for the selected role and date filters to export. Try adjusting your filters.', 'wpmd' ) ), admin_url( 'admin.php?page=wpmd-manage-users' ) ) );
         exit;
     }
 
@@ -981,6 +787,14 @@ function wpmd_export_users_to_csv( $user_role, $date_option, $date_single, $date
  * @return int|false Number of deleted users on success, false on error.
  */
 function wpmd_delete_users( $user_role, $delete_all, $date_option, $date_single, $date_condition, $date_start, $date_end ) {
+    error_log( 'wpmd_delete_users called for user role: ' . $user_role );
+    error_log( 'Delete all: ' . ( $delete_all ? 'true' : 'false' ) );
+    error_log( 'Date option: ' . $date_option );
+    error_log( 'Date single: ' . $date_single );
+    error_log( 'Date condition: ' . $date_condition );
+    error_log( 'Date start: ' . $date_start );
+    error_log( 'Date end: ' . $date_end );
+
     $args = array(
         'role'    => $user_role,
         'fields'  => 'ID',
@@ -988,7 +802,155 @@ function wpmd_delete_users( $user_role, $delete_all, $date_option, $date_single,
 
     if ( $delete_all ) {
         // No date filtering needed if deleting all
+        error_log( 'Deleting all users of role: ' . $user_role );
     } elseif ( 'single' === $date_option && ! empty( $date_single ) ) {
+        if ( 'before' === $date_condition ) {
+            $args['date_query'] = array(
+                array(
+                    'before'    => $date_single . ' 23:59:59',
+                    'inclusive' => true,
+                    'column'    => 'user_registered',
+                ),
+            );
+            error_log( 'Deleting users registered before: ' . $date_single );
+        } elseif ( 'after' === $date_condition ) {
+            $args['date_query'] = array(
+                array(
+                    'after'     => $date_single . ' 00:00:00',
+                    'inclusive' => true,
+                    'column'    => 'user_registered',
+                ),
+            );
+            error_log( 'Deleting users registered after: ' . $date_single );
+        }
+    } elseif ( 'range' === $date_option && ! empty( $date_start ) && ! empty( $date_end ) ) {
+        $args['date_query'] = array(
+            array(
+                'after'     => $date_start . ' 00:00:00',
+                'before'    => $date_end . ' 23:59:59',
+                'inclusive' => true,
+                'column'    => 'user_registered',
+            ),
+        );
+        error_log( 'Deleting users registered between: ' . $date_start . ' and ' . $date_end );
+    } else {
+        error_log( 'No valid deletion criteria for users. Returning 0.' );
+        return 0;
+    }
+
+    $users_to_delete = get_users( $args );
+    $deleted_count   = 0;
+
+    error_log( 'Found ' . count( $users_to_delete ) . ' users to delete.' );
+
+    if ( $users_to_delete ) {
+        // Get the current user's ID to prevent self-deletion
+        $current_user_id = get_current_user_id();
+        error_log( 'Current user ID: ' . $current_user_id );
+
+        foreach ( $users_to_delete as $user_id ) {
+            // Prevent deleting the currently logged-in admin user
+            if ( $user_id == $current_user_id ) {
+                error_log( 'Skipping deletion of current user ID: ' . $user_id );
+                continue;
+            }
+
+            // wp_delete_user takes two arguments: user ID and reassign_to (optional).
+            // Reassign to 1 (admin user) or null to delete content.
+            // For now, setting to null to delete all content from deleted user.
+            $result = wp_delete_user( $user_id, null ); // null means posts/links are deleted
+            if ( $result && ! is_wp_error( $result ) ) {
+                $deleted_count++;
+                error_log( 'Successfully deleted user ID: ' . $user_id );
+            } else {
+                // Log error or handle it as needed
+                $error_message = is_wp_error( $result ) ? $result->get_error_message() : 'Unknown error';
+                error_log( 'Error deleting user ID ' . $user_id . ': ' . $error_message );
+            }
+        }
+    } else {
+        error_log( 'No users found matching the criteria for deletion.' );
+    }
+
+    return $deleted_count;
+}
+
+/**
+ * AJAX handler to get post count based on filters.
+ */
+function wpmd_ajax_get_post_count() {
+    check_ajax_referer( 'wpmd_ajax_nonce', 'nonce' );
+
+    $post_type      = sanitize_text_field( $_POST['post_type'] );
+    $date_option    = sanitize_text_field( $_POST['date_option'] );
+    $date_single    = sanitize_text_field( $_POST['date_single'] );
+    $date_condition = sanitize_text_field( $_POST['date_condition'] );
+    $date_start     = sanitize_text_field( $_POST['date_start'] );
+    $date_end       = sanitize_text_field( $_POST['date_end'] );
+
+    $args = array(
+        'post_type'      => $post_type,
+        'posts_per_page' => -1,
+        'post_status'    => array( 'publish', 'pending', 'draft', 'auto-draft', 'future', 'private', 'inherit', 'trash' ),
+        'fields'         => 'ids', // Only fetch IDs for counting
+        'no_found_rows'  => true, // Optimize for counting
+        'update_post_term_cache' => false, // Don't fetch terms
+        'update_post_meta_cache' => false, // Don't fetch meta
+    );
+
+    // Apply date filters
+    if ( 'single' === $date_option && ! empty( $date_single ) ) {
+        if ( 'before' === $date_condition ) {
+            $args['date_query'] = array(
+                array(
+                    'before'    => $date_single . ' 23:59:59',
+                    'inclusive' => true,
+                ),
+            );
+        } elseif ( 'after' === $date_condition ) {
+            $args['date_query'] = array(
+                array(
+                    'after'     => $date_single . ' 00:00:00',
+                    'inclusive' => true,
+                ),
+            );
+        }
+    } elseif ( 'range' === $date_option && ! empty( $date_start ) && ! empty( $date_end ) ) {
+        $args['date_query'] = array(
+            array(
+                'after'     => $date_start . ' 00:00:00',
+                'before'    => $date_end . ' 23:59:59',
+                'inclusive' => true,
+            ),
+        );
+    }
+
+    $query = new WP_Query( $args );
+    wp_send_json_success( array( 'count' => $query->post_count ) );
+}
+add_action( 'wp_ajax_wpmd_get_post_count', 'wpmd_ajax_get_post_count' );
+
+/**
+ * AJAX handler to get user count based on filters.
+ */
+function wpmd_ajax_get_user_count() {
+    check_ajax_referer( 'wpmd_ajax_nonce', 'nonce' );
+
+    $user_role      = sanitize_text_field( $_POST['user_role'] );
+    $date_option    = sanitize_text_field( $_POST['date_option'] );
+    $date_single    = sanitize_text_field( $_POST['date_single'] );
+    $date_condition = sanitize_text_field( $_POST['date_condition'] );
+    $date_start     = sanitize_text_field( $_POST['date_start'] );
+    $date_end       = sanitize_text_field( $_POST['date_end'] );
+
+    $args = array(
+        'role'    => $user_role,
+        'fields'  => 'ID', // Only fetch IDs for counting
+        'number'  => -1,   // Get all users
+    );
+
+    // Apply date filters
+    if ( 'single' === $date_option && ! empty( $date_single ) ) {
         if ( 'before' === $date_condition ) {
             $args['date_query'] = array(
                 array(
@@ -1015,36 +977,295 @@ function wpmd_delete_users( $user_role, $delete_all, $date_option, $date_single,
                 'column'    => 'user_registered',
             ),
         );
-    } else {
-        // If no delete_all, and no valid date filter chosen, return 0.
-        return 0;
     }
 
-    $users_to_delete = get_users( $args );
-    $deleted_count   = 0;
+    $user_query = new WP_User_Query( $args );
+    wp_send_json_success( array( 'count' => $user_query->total_users ) );
+}
+add_action( 'wp_ajax_wpmd_get_user_count', 'wpmd_ajax_get_user_count' );
 
-    if ( $users_to_delete ) {
-        // Get the current user's ID to prevent self-deletion
-        $current_user_id = get_current_user_id();
+// Start of the JavaScript for dynamic counts and form toggling
+?>
+<script>
+    // This script will be output directly into the admin page.
+    // It uses jQuery, which is typically available in WordPress admin.
 
-        foreach ( $users_to_delete as $user_id ) {
-            // Prevent deleting the currently logged-in admin user
-            if ( $user_id == $current_user_id ) {
-                continue;
-            }
+    document.addEventListener('DOMContentLoaded', function() {
+        // --- Post Management Form Elements ---
+        const postExportTypeSelect = document.getElementById('wpmd_post_type_export');
+        const postExportDateOptionAll = document.getElementById('wpmd_export_date_option_all');
+        const postExportDateOptionSingle = document.getElementById('wpmd_export_date_option_single');
+        const postExportDateOptionRange = document.getElementById('wpmd_export_date_option_range');
+        const postExportDateSingle = document.getElementById('wpmd_export_date_single');
+        const postExportDateCondition = document.getElementById('wpmd_export_date_condition');
+        const postExportDateStart = document.getElementById('wpmd_export_date_start');
+        const postExportDateEnd = document.getElementById('wpmd_export_date_end');
+        const postExportCountInfo = document.getElementById('wpmd-export-post-count-info');
 
-            // wp_delete_user takes two arguments: user ID and reassign_to (optional).
-            // Reassign to 1 (admin user) or null to delete content.
-            // For now, setting to null to delete all content from deleted user.
-            $result = wp_delete_user( $user_id, null ); // null means posts/links are deleted
-            if ( $result && ! is_wp_error( $result ) ) {
-                $deleted_count++;
-            } else {
-                // Log error or handle it as needed
-                error_log( 'Error deleting user ID ' . $user_id . ': ' . ( is_wp_error( $result ) ? $result->get_error_message() : 'Unknown error' ) );
+        const postDeleteTypeSelect = document.getElementById('wpmd_post_type_delete');
+        const postDeleteDateOptionAll = document.getElementById('wpmd_delete_date_option_all');
+        const postDeleteDateOptionSingle = document.getElementById('wpmd_delete_date_option_single');
+        const postDeleteDateOptionRange = document.getElementById('wpmd_delete_date_option_range');
+        const postDeleteDateSingle = document.getElementById('wpmd_delete_date_single');
+        const postDeleteDateCondition = document.getElementById('wpmd_delete_date_condition');
+        const postDeleteDateStart = document.getElementById('wpmd_delete_date_start');
+        const postDeleteDateEnd = document.getElementById('wpmd_delete_date_end');
+        const postDeleteAllCheckbox = document.getElementById('wpmd_delete_all_posts');
+        const postDeleteCountInfo = document.getElementById('wpmd-delete-post-count-info');
+
+        // --- User Management Form Elements ---
+        const userExportRoleSelect = document.getElementById('wpmd_user_role_export');
+        const userExportDateOptionAll = document.getElementById('wpmd_user_export_date_option_all');
+        const userExportDateOptionSingle = document.getElementById('wpmd_user_export_date_option_single');
+        const userExportDateOptionRange = document.getElementById('wpmd_user_export_date_option_range');
+        const userExportDateSingle = document.getElementById('wpmd_user_export_date_single');
+        const userExportDateCondition = document.getElementById('wpmd_user_export_date_condition');
+        const userExportDateStart = document.getElementById('wpmd_user_export_date_start');
+        const userExportDateEnd = document.getElementById('wpmd_user_export_date_end');
+        const userExportCountInfo = document.getElementById('wpmd-export-user-count-info');
+
+        const userDeleteRoleSelect = document.getElementById('wpmd_user_role_delete');
+        const userDeleteDateOptionAll = document.getElementById('wpmd_user_delete_date_option_all');
+        const userDeleteDateOptionSingle = document.getElementById('wpmd_user_delete_date_option_single');
+        const userDeleteDateOptionRange = document.getElementById('wpmd_user_delete_date_option_range');
+        const userDeleteDateSingle = document.getElementById('wpmd_user_delete_date_single');
+        const userDeleteDateCondition = document.getElementById('wpmd_user_delete_date_condition');
+        const userDeleteDateStart = document.getElementById('wpmd_user_delete_date_start');
+        const userDeleteDateEnd = document.getElementById('wpmd_user_delete_date_end');
+        const userDeleteAllCheckbox = document.getElementById('wpmd_delete_all_users');
+        const userDeleteCountInfo = document.getElementById('wpmd-delete-user-count-info');
+
+        // --- Helper Function to Toggle Date Fields ---
+        function toggleDateFields(optionAll, optionSingle, optionRange, dateSingle, dateCondition, dateStart, dateEnd, allCheckbox = null) {
+            if (optionSingle.checked) {
+                dateSingle.disabled = false;
+                dateCondition.disabled = false;
+                dateStart.disabled = true;
+                dateEnd.disabled = true;
+                if (allCheckbox) allCheckbox.disabled = true;
+            } else if (optionRange.checked) {
+                dateSingle.disabled = true;
+                dateCondition.disabled = true;
+                dateStart.disabled = false;
+                dateEnd.disabled = false;
+                if (allCheckbox) allCheckbox.disabled = true;
+            } else { // 'all' is checked
+                dateSingle.disabled = true;
+                dateCondition.disabled = true;
+                dateStart.disabled = true;
+                dateEnd.disabled = true;
+                if (allCheckbox) allCheckbox.disabled = false;
             }
         }
-    }
 
-    return $deleted_count;
-}
+        // --- Functions to Fetch and Display Counts via AJAX ---
+        function updatePostCount(formType) { // 'export' or 'delete'
+            let postType, dateOption, dateSingle, dateCondition, dateStart, dateEnd, countInfoElement;
+
+            if (formType === 'export') {
+                postType = postExportTypeSelect.value;
+                dateOption = document.querySelector('input[name="wpmd_export_date_option"]:checked').value;
+                dateSingle = postExportDateSingle.value;
+                dateCondition = postExportDateCondition.value;
+                dateStart = postExportDateStart.value;
+                dateEnd = postExportDateEnd.value;
+                countInfoElement = postExportCountInfo;
+            } else { // formType === 'delete'
+                postType = postDeleteTypeSelect.value;
+                // If "delete all" is checked, override date options
+                if (postDeleteAllCheckbox && postDeleteAllCheckbox.checked) {
+                    dateOption = 'all'; // Treat as all for deletion count logic
+                } else {
+                    dateOption = document.querySelector('input[name="wpmd_delete_date_option"]:checked').value;
+                }
+                dateSingle = postDeleteDateSingle.value;
+                dateCondition = postDeleteDateCondition.value;
+                dateStart = postDeleteDateStart.value;
+                dateEnd = postDeleteDateEnd.value;
+                countInfoElement = postDeleteCountInfo;
+            }
+
+            countInfoElement.innerHTML = '<?php esc_html_e( 'Calculating...', 'wpmd' ); ?>';
+
+            // Ensure not to fetch count if 'delete all' is checked for delete form and no date filter applies
+            if (formType === 'delete' && postDeleteAllCheckbox.checked) {
+                countInfoElement.innerHTML = '<?php esc_html_e( 'All posts of the selected type will be deleted.', 'wpmd' ); ?>';
+                return;
+            }
+
+
+            jQuery.post(wpmd_ajax_object.ajax_url, {
+                action: 'wpmd_get_post_count',
+                nonce: wpmd_ajax_object.nonce,
+                post_type: postType,
+                date_option: dateOption,
+                date_single: dateSingle,
+                date_condition: dateCondition,
+                date_start: dateStart,
+                date_end: dateEnd
+            }, function(response) {
+                if (response.success) {
+                    let message = '';
+                    if (formType === 'export') {
+                        message = `<?php esc_html_e( 'Found %s posts to export.', 'wpmd' ); ?>`;
+                    } else {
+                        message = `<?php esc_html_e( 'Found %s posts matching criteria to delete.', 'wpmd' ); ?>`;
+                    }
+                    countInfoElement.innerHTML = message.replace('%s', `<strong>${response.data.count}</strong>`);
+                    if (response.data.count === 0) {
+                        countInfoElement.innerHTML += ' <?php esc_html_e( 'Consider adjusting your filters.', 'wpmd' ); ?>';
+                    }
+                } else {
+                    countInfoElement.innerHTML = '<?php esc_html_e( 'Could not retrieve post count.', 'wpmd' ); ?>';
+                    console.error('AJAX Error:', response);
+                }
+            }).fail(function(jqXHR, textStatus, errorThrown) {
+                countInfoElement.innerHTML = '<?php esc_html_e( 'Error connecting to server for post count.', 'wpmd' ); ?>';
+                console.error('AJAX Fail:', textStatus, errorThrown, jqXHR);
+            });
+        }
+
+        function updateUserCount(formType) { // 'export' or 'delete'
+            let userRole, dateOption, dateSingle, dateCondition, dateStart, dateEnd, countInfoElement;
+
+            if (formType === 'export') {
+                userRole = userExportRoleSelect.value;
+                dateOption = document.querySelector('input[name="wpmd_user_export_date_option"]:checked').value;
+                dateSingle = userExportDateSingle.value;
+                dateCondition = userExportDateCondition.value;
+                dateStart = userExportDateStart.value;
+                dateEnd = userExportDateEnd.value;
+                countInfoElement = userExportCountInfo;
+            } else { // formType === 'delete'
+                userRole = userDeleteRoleSelect.value;
+                 // If "delete all" is checked, override date options
+                if (userDeleteAllCheckbox && userDeleteAllCheckbox.checked) {
+                    dateOption = 'all'; // Treat as all for deletion count logic
+                } else {
+                    dateOption = document.querySelector('input[name="wpmd_user_delete_date_option"]:checked').value;
+                }
+                dateSingle = userDeleteDateSingle.value;
+                dateCondition = userDeleteDateCondition.value;
+                dateStart = userDeleteDateStart.value;
+                dateEnd = userDeleteDateEnd.value;
+                countInfoElement = userDeleteCountInfo;
+            }
+
+            countInfoElement.innerHTML = '<?php esc_html_e( 'Calculating...', 'wpmd' ); ?>';
+
+            // Ensure not to fetch count if 'delete all' is checked for delete form and no date filter applies
+            if (formType === 'delete' && userDeleteAllCheckbox.checked) {
+                countInfoElement.innerHTML = '<?php esc_html_e( 'All users of the selected role will be deleted (excluding current admin).', 'wpmd' ); ?>';
+                return;
+            }
+
+            jQuery.post(wpmd_ajax_object.ajax_url, {
+                action: 'wpmd_get_user_count',
+                nonce: wpmd_ajax_object.nonce,
+                user_role: userRole,
+                date_option: dateOption,
+                date_single: dateSingle,
+                date_condition: dateCondition,
+                date_start: dateStart,
+                date_end: dateEnd
+            }, function(response) {
+                if (response.success) {
+                    let message = '';
+                    if (formType === 'export') {
+                        message = `<?php esc_html_e( 'Found %s users to export.', 'wpmd' ); ?>`;
+                    } else {
+                        message = `<?php esc_html_e( 'Found %s users matching criteria to delete (excluding current admin).', 'wpmd' ); ?>`;
+                    }
+                    countInfoElement.innerHTML = message.replace('%s', `<strong>${response.data.count}</strong>`);
+                    if (response.data.count === 0) {
+                        countInfoElement.innerHTML += ' <?php esc_html_e( 'Consider adjusting your filters.', 'wpmd' ); ?>';
+                    }
+                } else {
+                    countInfoElement.innerHTML = '<?php esc_html_e( 'Could not retrieve user count.', 'wpmd' ); ?>';
+                    console.error('AJAX Error:', response);
+                }
+            }).fail(function(jqXHR, textStatus, errorThrown) {
+                countInfoElement.innerHTML = '<?php esc_html_e( 'Error connecting to server for user count.', 'wpmd' ); ?>';
+                console.error('AJAX Fail:', textStatus, errorThrown, jqXHR);
+            });
+        }
+
+        // --- Event Listeners for Post Management ---
+        if (postExportTypeSelect) {
+            postExportTypeSelect.addEventListener('change', () => updatePostCount('export'));
+            postExportDateOptionAll.addEventListener('change', () => { toggleDateFields(postExportDateOptionAll, postExportDateOptionSingle, postExportDateOptionRange, postExportDateSingle, postExportDateCondition, postExportDateStart, postExportDateEnd); updatePostCount('export'); });
+            postExportDateOptionSingle.addEventListener('change', () => { toggleDateFields(postExportDateOptionAll, postExportDateOptionSingle, postExportDateOptionRange, postExportDateSingle, postExportDateCondition, postExportDateStart, postExportDateEnd); updatePostCount('export'); });
+            postExportDateOptionRange.addEventListener('change', () => { toggleDateFields(postExportDateOptionAll, postExportDateOptionSingle, postExportDateOptionRange, postExportDateSingle, postExportDateCondition, postExportDateStart, postExportDateEnd); updatePostCount('export'); });
+            postExportDateSingle.addEventListener('change', () => updatePostCount('export'));
+            postExportDateCondition.addEventListener('change', () => updatePostCount('export'));
+            postExportDateStart.addEventListener('change', () => updatePostCount('export'));
+            postExportDateEnd.addEventListener('change', () => updatePostCount('export'));
+
+            // Initial call for export count
+            updatePostCount('export');
+        }
+
+        if (postDeleteTypeSelect) {
+            postDeleteTypeSelect.addEventListener('change', () => updatePostCount('delete'));
+            postDeleteDateOptionAll.addEventListener('change', () => { toggleDateFields(postDeleteDateOptionAll, postDeleteDateOptionSingle, postDeleteDateOptionRange, postDeleteDateSingle, postDeleteDateCondition, postDeleteDateStart, postDeleteDateEnd, postDeleteAllCheckbox); updatePostCount('delete'); });
+            postDeleteDateOptionSingle.addEventListener('change', () => { toggleDateFields(postDeleteDateOptionAll, postDeleteDateOptionSingle, postDeleteDateOptionRange, postDeleteDateSingle, postDeleteDateCondition, postDeleteDateStart, postDeleteDateEnd, postDeleteAllCheckbox); updatePostCount('delete'); });
+            postDeleteDateOptionRange.addEventListener('change', () => { toggleDateFields(postDeleteDateOptionAll, postDeleteDateOptionSingle, postDeleteDateOptionRange, postDeleteDateSingle, postDeleteDateCondition, postDeleteDateStart, postDeleteDateEnd, postDeleteAllCheckbox); updatePostCount('delete'); });
+            postDeleteDateSingle.addEventListener('change', () => updatePostCount('delete'));
+            postDeleteDateCondition.addEventListener('change', () => updatePostCount('delete'));
+            postDeleteDateStart.addEventListener('change', () => updatePostCount('delete'));
+            postDeleteDateEnd.addEventListener('change', () => updatePostCount('delete'));
+            if (postDeleteAllCheckbox) {
+                postDeleteAllCheckbox.addEventListener('change', () => { toggleDateFields(postDeleteDateOptionAll, postDeleteDateOptionSingle, postDeleteDateOptionRange, postDeleteDateSingle, postDeleteDateCondition, postDeleteDateStart, postDeleteDateEnd, postDeleteAllCheckbox); updatePostCount('delete'); });
+            }
+
+            // Initial state for delete all checkbox and date fields
+            if (postDeleteAllCheckbox && postDeleteAllCheckbox.checked) {
+                postDeleteDateOptionAll.disabled = true;
+                postDeleteDateOptionSingle.disabled = true;
+                postDeleteDateOptionRange.disabled = true;
+            }
+
+            // Initial call for delete count
+            updatePostCount('delete');
+        }
+
+        // --- Event Listeners for User Management ---
+        if (userExportRoleSelect) {
+            userExportRoleSelect.addEventListener('change', () => updateUserCount('export'));
+            userExportDateOptionAll.addEventListener('change', () => { toggleDateFields(userExportDateOptionAll, userExportDateOptionSingle, userExportDateOptionRange, userExportDateSingle, userExportDateCondition, userExportDateStart, userExportDateEnd); updateUserCount('export'); });
+            userExportDateOptionSingle.addEventListener('change', () => { toggleDateFields(userExportDateOptionAll, userExportDateOptionSingle, userExportDateOptionRange, userExportDateSingle, userExportDateCondition, userExportDateStart, userExportDateEnd); updateUserCount('export'); });
+            userExportDateOptionRange.addEventListener('change', () => { toggleDateFields(userExportDateOptionAll, userExportDateOptionSingle, userExportDateOptionRange, userExportDateSingle, userExportDateCondition, userExportDateStart, userExportDateEnd); updateUserCount('export'); });
+            userExportDateSingle.addEventListener('change', () => updateUserCount('export'));
+            userExportDateCondition.addEventListener('change', () => updateUserCount('export'));
+            userExportDateStart.addEventListener('change', () => updateUserCount('export'));
+            userExportDateEnd.addEventListener('change', () => updateUserCount('export'));
+
+            // Initial call for export count
+            updateUserCount('export');
+        }
+
+        if (userDeleteRoleSelect) {
+            userDeleteRoleSelect.addEventListener('change', () => updateUserCount('delete'));
+            userDeleteDateOptionAll.addEventListener('change', () => { toggleDateFields(userDeleteDateOptionAll, userDeleteDateOptionSingle, userDeleteDateOptionRange, userDeleteDateSingle, userDeleteDateCondition, userDeleteDateStart, userDeleteDateEnd, userDeleteAllCheckbox); updateUserCount('delete'); });
+            userDeleteDateOptionSingle.addEventListener('change', () => { toggleDateFields(userDeleteDateOptionAll, userDeleteDateOptionSingle, userDeleteDateOptionRange, userDeleteDateSingle, userDeleteDateCondition, userDeleteDateStart, userDeleteDateEnd, userDeleteAllCheckbox); updateUserCount('delete'); });
+            userDeleteDateOptionRange.addEventListener('change', () => { toggleDateFields(userDeleteDateOptionAll, userDeleteDateOptionSingle, userDeleteDateOptionRange, userDeleteDateSingle, userDeleteDateCondition, userDeleteDateStart, userDeleteDateEnd, userDeleteAllCheckbox); updateUserCount('delete'); });
+            userDeleteDateSingle.addEventListener('change', () => updateUserCount('delete'));
+            userDeleteDateCondition.addEventListener('change', () => updateUserCount('delete'));
+            userDeleteDateStart.addEventListener('change', () => updateUserCount('delete'));
+            userDeleteDateEnd.addEventListener('change', () => updateUserCount('delete'));
+            if (userDeleteAllCheckbox) {
+                userDeleteAllCheckbox.addEventListener('change', () => { toggleDateFields(userDeleteDateOptionAll, userDeleteDateOptionSingle, userDeleteDateOptionRange, userDeleteDateSingle, userDeleteDateCondition, userDeleteDateStart, userDeleteDateEnd, userDeleteAllCheckbox); updateUserCount('delete'); });
+            }
+
+            // Initial state for delete all checkbox and date fields
+            if (userDeleteAllCheckbox && userDeleteAllCheckbox.checked) {
+                userDeleteDateOptionAll.disabled = true;
+                userDeleteDateOptionSingle.disabled = true;
+                userDeleteDateOptionRange.disabled = true;
+            }
+
+            // Initial call for delete count
+            updateUserCount('delete');
+        }
+    });
+</script>
